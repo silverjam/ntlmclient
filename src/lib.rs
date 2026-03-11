@@ -117,7 +117,7 @@ use digest::Digest;
 use hmac::{Hmac, Mac};
 use md4::Md4;
 use md5::Md5;
-use rand::rngs::OsRng;
+use rand::rng;
 use rand::Rng;
 
 #[cfg(windows)]
@@ -1345,7 +1345,7 @@ pub fn respond_challenge_ntlm_v1_extended(
     creds: &Credentials,
 ) -> ChallengeResponse {
     let mut client_challenge: [u8; 8] = [0; 8];
-    OsRng.fill(&mut client_challenge);
+    rng().fill(&mut client_challenge);
 
     let ntlm_key = ntlm_v1_password_func(&creds.password);
 
@@ -1389,7 +1389,7 @@ pub fn respond_challenge_ntlm_v2(
     creds: &Credentials,
 ) -> ChallengeResponse {
     let mut client_challenge: [u8; 8] = [0; 8];
-    OsRng.fill(&mut client_challenge);
+    rng().fill(&mut client_challenge);
 
     let mut temp = Vec::new();
     temp.push(0x01); // Responserversion
