@@ -119,6 +119,8 @@ use md4::Md4;
 use md5::Md5;
 use rand::rng;
 use rand::Rng;
+use rc4::{Rc4, StreamCipher};
+use sha2::Sha256;
 
 #[cfg(windows)]
 use crate::encoding_windows::{ansi_string_to_rust, rust_string_to_ansi};
@@ -402,6 +404,8 @@ pub struct AuthenticateMessage {
     pub session_key: Vec<u8>,
     pub flags: Flags,
     pub os_version: OsVersion,
+    /// Optional 16-byte MIC, occupying bytes 72..88 of the serialized message when present.
+    pub mic: Option<[u8; 16]>,
 }
 
 /// An NTLM security buffer, pointing to a string contained later in the message.
@@ -833,6 +837,14 @@ impl TryFrom<&[u8]> for ChallengeMessage {
 }
 
 impl AuthenticateMessage {
+    /// The byte offset of the MIC field within the full NTLM message (including magic + type).
+    ///
+    /// This is 8 (magic) + 4 (type) + 48 (6 security buffers) + 4 (flags) + 8 (version) = 72.
+    pub const MIC_OFFSET: usize = 72;
+
+    /// The length of the MIC field in bytes.
+    pub const MIC_LENGTH: usize = 16;
+
     /// Serializes the Authenticate message body into bytes.
     pub fn to_bytes(&self) -> Result<Vec<u8>, StoringError> {
         let mut sec_buffer_offset: u32
@@ -847,6 +859,10 @@ impl AuthenticateMessage {
             + 4 // flags
             + 8 // version
             ;
+
+        if self.mic.is_some() {
+            sec_buffer_offset += Self::MIC_LENGTH as u32;
+        }
 
         let mut ret = Vec::new();
         let mut data_block = Vec::new();
@@ -892,6 +908,11 @@ impl AuthenticateMessage {
         );
         ret.extend_from_slice(&self.flags.bits().to_le_bytes());
         ret.extend_from_slice(&self.os_version.to_bytes());
+
+        if let Some(mic) = &self.mic {
+            ret.extend_from_slice(mic);
+        }
+
         ret.append(&mut data_block);
         Ok(ret)
     }
@@ -939,6 +960,31 @@ impl TryFrom<&[u8]> for AuthenticateMessage {
         let workstation_name = ntlm_bytes_to_string(flags, workstation_name_bytes)?;
         let session_key = Vec::from(session_key_bytes);
 
+        // MIC is present if all security buffer offsets are >= 88 (header + MIC)
+        let min_data_offset = [
+            &lm_response_secbuf,
+            &ntlm_response_secbuf,
+            &domain_name_secbuf,
+            &user_name_secbuf,
+            &workstation_name_secbuf,
+            &session_key_secbuf,
+        ]
+        .iter()
+        .filter(|sb| sb.length > 0)
+        .map(|sb| sb.offset)
+        .min();
+
+        let mic = if min_data_offset.unwrap_or(0) >= 88 && value.len() >= 76 {
+            let mic_bytes: [u8; 16] = value[60..76].try_into().unwrap();
+            if mic_bytes == [0u8; 16] {
+                None
+            } else {
+                Some(mic_bytes)
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             lm_response,
             ntlm_response,
@@ -948,6 +994,7 @@ impl TryFrom<&[u8]> for AuthenticateMessage {
             session_key,
             flags,
             os_version,
+            mic,
         })
     }
 }
@@ -1138,6 +1185,7 @@ impl ChallengeResponse {
             session_key: self.session_key.clone(),
             flags,
             os_version: Default::default(),
+            mic: None,
         })
     }
 }
@@ -1442,5 +1490,1443 @@ pub fn respond_challenge_ntlm_v2(
         lm_response,
         ntlm_response,
         session_key,
+    }
+}
+
+// Channel Binding Token (CBT) / Extended Protection for Authentication (EPA)
+
+/// The `MsvAvFlags` bit indicating that the client has computed a MIC and included it in the
+/// Type 3 message.
+pub const AV_FLAGS_MIC_PROVIDED: u32 = 0x0000_0002;
+
+/// Computes the 16-byte NTLM channel binding hash from a server's DER-encoded TLS certificate.
+///
+/// Implements `tls-server-end-point` channel binding (RFC 5929) via the GSS channel
+/// bindings struct (RFC 4121 §4.1.1.2), producing the `MsvAvChannelBindings` value.
+pub fn compute_channel_bindings_hash(server_cert_der: &[u8]) -> [u8; 16] {
+    let cert_hash = <Sha256 as Digest>::digest(server_cert_der);
+
+    let mut application_data = b"tls-server-end-point:".to_vec();
+    application_data.extend_from_slice(&cert_hash);
+
+    // GSS channel bindings: 4 zero fields (initiator/acceptor addr type + length) + app data
+    let mut gss_bindings = Vec::with_capacity(20 + application_data.len());
+    for _ in 0..4 {
+        gss_bindings.extend_from_slice(&0u32.to_le_bytes());
+    }
+    gss_bindings.extend_from_slice(&(application_data.len() as u32).to_le_bytes());
+    gss_bindings.extend_from_slice(&application_data);
+
+    <Md5 as Digest>::digest(&gss_bindings).into()
+}
+
+/// Injects `MsvAvChannelBindings` and/or `MsvAvFlags` into a target info entry list,
+/// replacing any pre-existing values. Always re-adds the terminator.
+///
+/// - `cbt_hash`: if `Some`, replaces any existing `ChannelBindings` entry.
+/// - `flags_value`: if `Some`, replaces any existing `Flags` entry with this value.
+///   If `None`, preserves the original `Flags` entry (if any).
+pub fn inject_av_pairs(
+    target_info: &[TargetInfoEntry],
+    cbt_hash: Option<[u8; 16]>,
+    flags_value: Option<u32>,
+) -> Vec<TargetInfoEntry> {
+    let mut result: Vec<TargetInfoEntry> = Vec::with_capacity(target_info.len() + 3);
+
+    for entry in target_info {
+        match entry.entry_type {
+            TargetInfoType::Terminator => {}
+            TargetInfoType::ChannelBindings => {}
+            TargetInfoType::Flags if flags_value.is_some() => {}
+            _ => result.push(entry.clone()),
+        }
+    }
+
+    if let Some(fv) = flags_value {
+        result.push(TargetInfoEntry {
+            entry_type: TargetInfoType::Flags,
+            data: fv.to_le_bytes().to_vec(),
+        });
+    }
+
+    if let Some(hash) = cbt_hash {
+        result.push(TargetInfoEntry {
+            entry_type: TargetInfoType::ChannelBindings,
+            data: hash.to_vec(),
+        });
+    }
+
+    result.push(TargetInfoEntry {
+        entry_type: TargetInfoType::Terminator,
+        data: Vec::new(),
+    });
+
+    result
+}
+
+/// Parses raw target_info bytes into a list of [`TargetInfoEntry`] values.
+pub fn parse_target_info(mut bytes: &[u8]) -> Result<Vec<TargetInfoEntry>, ParsingError> {
+    let mut entries = Vec::new();
+    while !bytes.is_empty() {
+        let (entry, rest) = TargetInfoEntry::try_from_bytes(bytes)?;
+        entries.push(entry);
+        bytes = rest;
+    }
+    Ok(entries)
+}
+
+/// Serializes a list of [`TargetInfoEntry`] values into raw bytes.
+pub fn serialize_target_info(entries: &[TargetInfoEntry]) -> Vec<u8> {
+    entries.iter().flat_map(|e| e.to_bytes()).collect()
+}
+
+/// Reads the `MsvAvFlags` value from a target info entry list, if present.
+pub fn get_av_flags(target_info: &[TargetInfoEntry]) -> Option<u32> {
+    for entry in target_info {
+        if entry.entry_type == TargetInfoType::Flags && entry.data.len() == 4 {
+            return Some(u32::from_le_bytes(entry.data[0..4].try_into().unwrap()));
+        }
+    }
+    None
+}
+
+/// Returns `true` if the target info entries contain an `MsvAvTimestamp` entry.
+pub fn has_av_timestamp(target_info: &[TargetInfoEntry]) -> bool {
+    target_info
+        .iter()
+        .any(|e| e.entry_type == TargetInfoType::Timestamp)
+}
+
+/// Returns `true` when `MsvAvFlags` contains the `MIC_PROVIDED` bit (`0x0000_0002`).
+///
+/// This is the strict check. For the softer check that also triggers on `MsvAvTimestamp`
+/// presence, see [`server_suggests_mic`].
+pub fn server_requires_mic(target_info: &[TargetInfoEntry]) -> bool {
+    get_av_flags(target_info).unwrap_or(0) & AV_FLAGS_MIC_PROVIDED != 0
+}
+
+/// Returns `true` when `MsvAvFlags` has the `MIC_PROVIDED` bit set, **or** when
+/// `MsvAvTimestamp` is present (MS-NLMP §3.1.5.1.2 SHOULD).
+pub fn server_suggests_mic(target_info: &[TargetInfoEntry]) -> bool {
+    server_requires_mic(target_info) || has_av_timestamp(target_info)
+}
+
+// NTLMv2 Builder API
+
+/// An error that may occur while building an NTLMv2 response.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum BuildError {
+    /// The server requires a MIC but the negotiate and/or challenge message bytes were not
+    /// provided via [`NtlmV2Builder::mic`].
+    MicRequiredButMessagesNotProvided,
+
+    /// An error occurred while serializing the authenticate message.
+    Storing(StoringError),
+
+    /// An error occurred while parsing the target info bytes.
+    Parsing(ParsingError),
+}
+impl fmt::Display for BuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MicRequiredButMessagesNotProvided => write!(
+                f,
+                "server requires MIC but negotiate/challenge message bytes were not provided"
+            ),
+            Self::Storing(e) => write!(f, "storing error: {}", e),
+            Self::Parsing(e) => write!(f, "parsing error: {}", e),
+        }
+    }
+}
+impl std::error::Error for BuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::MicRequiredButMessagesNotProvided => None,
+            Self::Storing(e) => Some(e),
+            Self::Parsing(e) => Some(e),
+        }
+    }
+}
+impl From<StoringError> for BuildError {
+    fn from(e: StoringError) -> Self {
+        Self::Storing(e)
+    }
+}
+impl From<ParsingError> for BuildError {
+    fn from(e: ParsingError) -> Self {
+        Self::Parsing(e)
+    }
+}
+
+/// A builder for NTLMv2 authenticate messages with optional CBT and MIC support.
+///
+/// ```ignore
+/// let type3_bytes = NtlmV2Builder::new(challenge, &target_info, time, &creds)
+///     .channel_binding(server_cert_der)
+///     .mic(&negotiate_msg_bytes, &challenge_msg_bytes)
+///     .build()?;
+/// ```
+pub struct NtlmV2Builder<'a> {
+    challenge: [u8; 8],
+    target_info: &'a [u8],
+    time: i64,
+    credentials: &'a Credentials,
+    server_cert_der: Option<&'a [u8]>,
+    negotiate_msg_bytes: Option<&'a [u8]>,
+    challenge_msg_bytes: Option<&'a [u8]>,
+    workstation: &'a str,
+    flags: Flags,
+    client_challenge: Option<[u8; 8]>,
+    exported_session_key: Option<[u8; 16]>,
+}
+
+impl<'a> NtlmV2Builder<'a> {
+    /// Creates a new builder with the required parameters.
+    pub fn new(
+        challenge: [u8; 8],
+        target_info: &'a [u8],
+        time: i64,
+        credentials: &'a Credentials,
+    ) -> Self {
+        Self {
+            challenge,
+            target_info,
+            time,
+            credentials,
+            server_cert_der: None,
+            negotiate_msg_bytes: None,
+            challenge_msg_bytes: None,
+            workstation: "",
+            flags: Flags::NEGOTIATE_UNICODE | Flags::NEGOTIATE_NTLM,
+            client_challenge: None,
+            exported_session_key: None,
+        }
+    }
+
+    /// Enables Channel Binding Token (CBT) using the server's DER-encoded TLS certificate.
+    pub fn channel_binding(mut self, server_cert_der: &'a [u8]) -> Self {
+        self.server_cert_der = Some(server_cert_der);
+        self
+    }
+
+    /// Provides the raw Type 1 and Type 2 message bytes for MIC computation.
+    ///
+    /// When provided, a MIC is included in the Type 3 message. Required if the server's
+    /// `MsvAvFlags` has the `MIC_PROVIDED` bit set.
+    pub fn mic(mut self, negotiate_msg_bytes: &'a [u8], challenge_msg_bytes: &'a [u8]) -> Self {
+        self.negotiate_msg_bytes = Some(negotiate_msg_bytes);
+        self.challenge_msg_bytes = Some(challenge_msg_bytes);
+        self
+    }
+
+    /// Sets the workstation name included in the Type 3 message (default: empty string).
+    pub fn workstation(mut self, workstation: &'a str) -> Self {
+        self.workstation = workstation;
+        self
+    }
+
+    /// Overrides the negotiate flags included in the Type 3 message.
+    ///
+    /// Default: `NEGOTIATE_UNICODE | NEGOTIATE_NTLM`.
+    pub fn flags(mut self, flags: Flags) -> Self {
+        self.flags = flags;
+        self
+    }
+
+    /// Sets a fixed client challenge for testing. If not set, a random challenge is generated.
+    pub fn client_challenge(mut self, challenge: [u8; 8]) -> Self {
+        self.client_challenge = Some(challenge);
+        self
+    }
+
+    /// Sets a fixed ExportedSessionKey for testing. Only meaningful when KEY_EXCH is active.
+    pub fn exported_session_key(mut self, key: [u8; 16]) -> Self {
+        self.exported_session_key = Some(key);
+        self
+    }
+
+    /// Builds the NTLMv2 response without MIC, returning just the [`ChallengeResponse`].
+    ///
+    /// Applies CBT (if configured) to the target info but does NOT compute a MIC.
+    /// If `MsvAvTimestamp` is present, the `lm_response` is set to `Z(24)` per MS-NLMP §3.1.5.1.2.
+    pub fn build_response(&self) -> Result<ChallengeResponse, BuildError> {
+        let parsed = parse_target_info(self.target_info)?;
+        let target_info_bytes = self.prepare_target_info_from(&parsed, false)?;
+        let mut response = self.compute_response(&target_info_bytes);
+
+        if has_av_timestamp(&parsed) {
+            response.lm_response = vec![0u8; 24];
+        }
+
+        Ok(response)
+    }
+
+    /// Builds the complete Type 3 authenticate message as serialized bytes.
+    ///
+    /// This is the primary method for most use cases. It handles CBT injection,
+    /// MIC auto-detection, NTLMv2 response computation, KEY_EXCH derivation,
+    /// and MIC patching.
+    pub fn build(&self) -> Result<Vec<u8>, BuildError> {
+        let parsed_target_info = parse_target_info(self.target_info)?;
+        let have_mic_bytes =
+            self.negotiate_msg_bytes.is_some() && self.challenge_msg_bytes.is_some();
+
+        if server_requires_mic(&parsed_target_info) && !have_mic_bytes {
+            return Err(BuildError::MicRequiredButMessagesNotProvided);
+        }
+
+        let include_mic = have_mic_bytes;
+        let target_info_bytes = self.prepare_target_info_from(&parsed_target_info, include_mic)?;
+        let response = self.compute_response(&target_info_bytes);
+
+        let lm_response = if has_av_timestamp(&parsed_target_info) {
+            vec![0u8; 24]
+        } else {
+            response.lm_response
+        };
+
+        // KEY_EXCH: derive ExportedSessionKey when KEY_EXCH + (SIGN or SEAL) are set
+        let key_exch_active = self.flags.contains(Flags::NEGOTIATE_KEY_EXCHANGE)
+            && self
+                .flags
+                .intersects(Flags::NEGOTIATE_SIGN | Flags::NEGOTIATE_SEAL);
+
+        let (exported_session_key, encrypted_random_session_key) = if key_exch_active {
+            let esk = self.exported_session_key.unwrap_or_else(|| {
+                let mut nonce = [0u8; 16];
+                rng().fill(&mut nonce);
+                nonce
+            });
+            let mut encrypted = esk;
+            let key = rc4::Key::<rc4::consts::U16>::from_slice(&response.session_key);
+            let mut rc4: Rc4<rc4::consts::U16> = <Rc4<rc4::consts::U16> as KeyInit>::new(key);
+            rc4.apply_keystream(&mut encrypted);
+            (esk.to_vec(), encrypted.to_vec())
+        } else {
+            (response.session_key.clone(), vec![])
+        };
+
+        let auth_msg = AuthenticateMessage {
+            lm_response,
+            ntlm_response: response.ntlm_response,
+            domain_name: self.credentials.domain.clone(),
+            user_name: self.credentials.username.clone(),
+            workstation_name: self.workstation.to_owned(),
+            session_key: encrypted_random_session_key,
+            flags: self.flags,
+            os_version: Default::default(),
+            mic: if include_mic { Some([0u8; 16]) } else { None },
+        };
+
+        let message = Message::Authenticate(auth_msg);
+        let mut msg_bytes = message.to_bytes()?;
+
+        if include_mic {
+            let negotiate_bytes = self.negotiate_msg_bytes.unwrap();
+            let challenge_bytes = self.challenge_msg_bytes.unwrap();
+
+            let mut hmac_md5: Hmac<Md5> =
+                <Hmac<Md5> as Mac>::new_from_slice(&exported_session_key).unwrap();
+            hmac_md5.update(negotiate_bytes);
+            hmac_md5.update(challenge_bytes);
+            hmac_md5.update(&msg_bytes);
+
+            let mic: [u8; 16] = hmac_md5.finalize().into_bytes().into();
+            msg_bytes[AuthenticateMessage::MIC_OFFSET
+                ..AuthenticateMessage::MIC_OFFSET + AuthenticateMessage::MIC_LENGTH]
+                .copy_from_slice(&mic);
+        }
+
+        Ok(msg_bytes)
+    }
+
+    /// Prepares the target info bytes, injecting CBT and MIC flags as needed.
+    fn prepare_target_info_from(
+        &self,
+        entries: &[TargetInfoEntry],
+        include_mic: bool,
+    ) -> Result<Vec<u8>, BuildError> {
+        if self.server_cert_der.is_none() && !include_mic {
+            return Ok(self.target_info.to_vec());
+        }
+
+        let cbt_hash = self.server_cert_der.map(compute_channel_bindings_hash);
+        let mut flags_value = get_av_flags(entries).unwrap_or(0);
+        if include_mic {
+            flags_value |= AV_FLAGS_MIC_PROVIDED;
+        }
+
+        let modified = inject_av_pairs(entries, cbt_hash, Some(flags_value));
+        Ok(serialize_target_info(&modified))
+    }
+
+    fn compute_response(&self, target_info: &[u8]) -> ChallengeResponse {
+        let client_challenge = self.client_challenge.unwrap_or_else(|| {
+            let mut cc = [0u8; 8];
+            rng().fill(&mut cc);
+            cc
+        });
+
+        let mut temp = Vec::new();
+        temp.push(0x01); // Responserversion
+        temp.push(0x01); // HiResponserversion
+        for _ in 0..6 {
+            temp.push(0x00);
+        }
+        temp.extend_from_slice(&self.time.to_le_bytes());
+        temp.extend_from_slice(&client_challenge);
+        for _ in 0..4 {
+            temp.push(0x00);
+        }
+        temp.extend_from_slice(target_info);
+        for _ in 0..4 {
+            temp.push(0x00);
+        }
+
+        let ntlm_key = ntlm_v2_password_func(self.credentials);
+
+        let nt_proof_string = {
+            let mut hmac_md5: Hmac<Md5> = <Hmac<Md5> as Mac>::new_from_slice(&ntlm_key).unwrap();
+            hmac_md5.update(&self.challenge);
+            hmac_md5.update(&temp);
+
+            let mut ps = [0u8; 16];
+            ps.copy_from_slice(hmac_md5.finalize().into_bytes().as_slice());
+            ps
+        };
+
+        let mut ntlm_response = Vec::with_capacity(16 + temp.len());
+        ntlm_response.extend_from_slice(&nt_proof_string);
+        ntlm_response.extend_from_slice(&temp);
+
+        let mut lm_response = Vec::with_capacity(16 + 8);
+        {
+            let mut hmac_md5: Hmac<Md5> = <Hmac<Md5> as Mac>::new_from_slice(&ntlm_key).unwrap();
+            hmac_md5.update(&self.challenge);
+            hmac_md5.update(&client_challenge);
+            lm_response.extend_from_slice(hmac_md5.finalize().into_bytes().as_slice());
+        }
+        lm_response.extend_from_slice(&client_challenge);
+
+        let session_key = {
+            let mut hmac_md5: Hmac<Md5> = <Hmac<Md5> as Mac>::new_from_slice(&ntlm_key).unwrap();
+            hmac_md5.update(&nt_proof_string);
+            Vec::from(hmac_md5.finalize().into_bytes().as_slice())
+        };
+
+        ChallengeResponse {
+            lm_response,
+            ntlm_response,
+            session_key,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compute_channel_bindings_hash() {
+        // Deterministic: same input always yields same output
+        let h1 = compute_channel_bindings_hash(b"cert-a");
+        let h2 = compute_channel_bindings_hash(b"cert-a");
+        assert_eq!(h1, h2);
+
+        // Different inputs yield different outputs
+        let h3 = compute_channel_bindings_hash(b"cert-b");
+        assert_ne!(h1, h3);
+    }
+
+    #[test]
+    fn test_inject_cbt_into_existing_entries() {
+        let entries = vec![
+            TargetInfoEntry::from_string(TargetInfoType::NtDomain, "TEST"),
+            TargetInfoEntry::from_string(TargetInfoType::DnsDomain, "test.local"),
+            TargetInfoEntry {
+                entry_type: TargetInfoType::Terminator,
+                data: Vec::new(),
+            },
+        ];
+
+        let cbt_hash = [0xAA; 16];
+        let result = inject_av_pairs(&entries, Some(cbt_hash), Some(0));
+
+        assert_eq!(result.len(), 5);
+        assert_eq!(result[0].entry_type, TargetInfoType::NtDomain);
+        assert_eq!(result[1].entry_type, TargetInfoType::DnsDomain);
+        assert_eq!(result[2].entry_type, TargetInfoType::Flags);
+        assert_eq!(result[2].data, 0u32.to_le_bytes());
+        assert_eq!(result[3].entry_type, TargetInfoType::ChannelBindings);
+        assert_eq!(result[3].data, vec![0xAA; 16]);
+        assert_eq!(result[4].entry_type, TargetInfoType::Terminator);
+    }
+
+    #[test]
+    fn test_inject_replaces_existing_flags_and_cbt() {
+        let entries = vec![
+            TargetInfoEntry::from_string(TargetInfoType::NtDomain, "TEST"),
+            TargetInfoEntry {
+                entry_type: TargetInfoType::Flags,
+                data: 0x1234u32.to_le_bytes().to_vec(),
+            },
+            TargetInfoEntry {
+                entry_type: TargetInfoType::ChannelBindings,
+                data: vec![0xFF; 16],
+            },
+            TargetInfoEntry {
+                entry_type: TargetInfoType::Terminator,
+                data: Vec::new(),
+            },
+        ];
+
+        let cbt_hash = [0xBB; 16];
+        let result = inject_av_pairs(&entries, Some(cbt_hash), Some(AV_FLAGS_MIC_PROVIDED));
+
+        assert_eq!(result.len(), 4);
+        assert_eq!(result[0].entry_type, TargetInfoType::NtDomain);
+        assert_eq!(result[1].entry_type, TargetInfoType::Flags);
+        assert_eq!(
+            u32::from_le_bytes(result[1].data[..].try_into().unwrap()),
+            AV_FLAGS_MIC_PROVIDED
+        );
+        assert_eq!(result[2].entry_type, TargetInfoType::ChannelBindings);
+        assert_eq!(result[2].data, vec![0xBB; 16]);
+        assert_eq!(result[3].entry_type, TargetInfoType::Terminator);
+    }
+
+    #[test]
+    fn test_inject_empty_target_info() {
+        // Empty target info (no entries at all)
+        let entries: Vec<TargetInfoEntry> = Vec::new();
+        let cbt_hash = [0xCC; 16];
+        let result = inject_av_pairs(&entries, Some(cbt_hash), Some(0));
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].entry_type, TargetInfoType::Flags);
+        assert_eq!(result[1].entry_type, TargetInfoType::ChannelBindings);
+        assert_eq!(result[2].entry_type, TargetInfoType::Terminator);
+    }
+
+    #[test]
+    fn test_server_requires_mic_with_flags() {
+        let entries = vec![
+            TargetInfoEntry {
+                entry_type: TargetInfoType::Flags,
+                data: AV_FLAGS_MIC_PROVIDED.to_le_bytes().to_vec(),
+            },
+            TargetInfoEntry {
+                entry_type: TargetInfoType::Terminator,
+                data: Vec::new(),
+            },
+        ];
+        assert!(server_requires_mic(&entries));
+    }
+
+    #[test]
+    fn test_server_requires_mic_not_triggered_by_timestamp_alone() {
+        let entries = vec![
+            TargetInfoEntry {
+                entry_type: TargetInfoType::Timestamp,
+                data: 0i64.to_le_bytes().to_vec(),
+            },
+            TargetInfoEntry {
+                entry_type: TargetInfoType::Terminator,
+                data: Vec::new(),
+            },
+        ];
+        assert!(!server_requires_mic(&entries));
+        assert!(server_suggests_mic(&entries));
+    }
+
+    #[test]
+    fn test_server_does_not_require_mic() {
+        let entries = vec![
+            TargetInfoEntry::from_string(TargetInfoType::NtDomain, "TEST"),
+            TargetInfoEntry {
+                entry_type: TargetInfoType::Terminator,
+                data: Vec::new(),
+            },
+        ];
+        assert!(!server_requires_mic(&entries));
+    }
+
+    #[test]
+    fn test_type3_without_mic_no_extra_bytes() {
+        let auth = AuthenticateMessage {
+            lm_response: vec![0; 24],
+            ntlm_response: vec![0; 24],
+            domain_name: String::new(),
+            user_name: String::new(),
+            workstation_name: String::new(),
+            session_key: Vec::new(),
+            flags: Flags::NEGOTIATE_UNICODE | Flags::NEGOTIATE_NTLM,
+            os_version: Default::default(),
+            mic: None,
+        };
+
+        let msg = Message::Authenticate(auth);
+        let bytes = msg.to_bytes().unwrap();
+
+        let lm_secbuf = SecurityBuffer::try_from(&bytes[12..20]).unwrap();
+        assert_eq!(lm_secbuf.offset, 72);
+    }
+
+    #[test]
+    fn test_type3_with_mic_reserves_16_bytes() {
+        let auth = AuthenticateMessage {
+            lm_response: vec![0; 24],
+            ntlm_response: vec![0; 24],
+            domain_name: String::new(),
+            user_name: String::new(),
+            workstation_name: String::new(),
+            session_key: Vec::new(),
+            flags: Flags::NEGOTIATE_UNICODE | Flags::NEGOTIATE_NTLM,
+            os_version: Default::default(),
+            mic: Some([0x42; 16]),
+        };
+
+        let msg = Message::Authenticate(auth.clone());
+        let bytes = msg.to_bytes().unwrap();
+
+        let lm_secbuf = SecurityBuffer::try_from(&bytes[12..20]).unwrap();
+        assert_eq!(lm_secbuf.offset, 88);
+
+        assert_eq!(
+            &bytes[AuthenticateMessage::MIC_OFFSET
+                ..AuthenticateMessage::MIC_OFFSET + AuthenticateMessage::MIC_LENGTH],
+            &[0x42; 16]
+        );
+    }
+
+    #[test]
+    fn test_type3_round_trip_with_mic() {
+        let auth = AuthenticateMessage {
+            lm_response: vec![1, 2, 3],
+            ntlm_response: vec![4, 5, 6],
+            domain_name: String::new(),
+            user_name: String::new(),
+            workstation_name: String::new(),
+            session_key: vec![7, 8],
+            flags: Flags::NEGOTIATE_UNICODE | Flags::NEGOTIATE_NTLM,
+            os_version: Default::default(),
+            mic: Some([0xAB; 16]),
+        };
+
+        let msg = Message::Authenticate(auth.clone());
+        let bytes = msg.to_bytes().unwrap();
+        let parsed = Message::try_from(bytes.as_slice()).unwrap();
+
+        match parsed {
+            Message::Authenticate(parsed_auth) => {
+                assert_eq!(parsed_auth.lm_response, auth.lm_response);
+                assert_eq!(parsed_auth.ntlm_response, auth.ntlm_response);
+                assert_eq!(parsed_auth.session_key, auth.session_key);
+                assert_eq!(parsed_auth.mic, Some([0xAB; 16]));
+            }
+            _ => panic!("expected Authenticate message"),
+        }
+    }
+
+    #[test]
+    fn test_type3_round_trip_without_mic() {
+        let auth = AuthenticateMessage {
+            lm_response: vec![1, 2, 3],
+            ntlm_response: vec![4, 5, 6],
+            domain_name: String::new(),
+            user_name: String::new(),
+            workstation_name: String::new(),
+            session_key: vec![7, 8],
+            flags: Flags::NEGOTIATE_UNICODE | Flags::NEGOTIATE_NTLM,
+            os_version: Default::default(),
+            mic: None,
+        };
+
+        let msg = Message::Authenticate(auth.clone());
+        let bytes = msg.to_bytes().unwrap();
+        let parsed = Message::try_from(bytes.as_slice()).unwrap();
+
+        match parsed {
+            Message::Authenticate(parsed_auth) => {
+                assert_eq!(parsed_auth.lm_response, auth.lm_response);
+                assert_eq!(parsed_auth.ntlm_response, auth.ntlm_response);
+                assert_eq!(parsed_auth.session_key, auth.session_key);
+                assert_eq!(parsed_auth.mic, None);
+            }
+            _ => panic!("expected Authenticate message"),
+        }
+    }
+
+    #[test]
+    fn test_builder_basic() {
+        let creds = Credentials {
+            username: "User".to_owned(),
+            password: "Password".to_owned(),
+            domain: "Domain".to_owned(),
+        };
+
+        let challenge = [0x01; 8];
+        let target_info_entries = vec![
+            TargetInfoEntry::from_string(TargetInfoType::NtDomain, "TEST"),
+            TargetInfoEntry {
+                entry_type: TargetInfoType::Terminator,
+                data: Vec::new(),
+            },
+        ];
+        let target_info = serialize_target_info(&target_info_entries);
+
+        let result = NtlmV2Builder::new(challenge, &target_info, 0, &creds)
+            .client_challenge([0x02; 8])
+            .build();
+
+        assert!(result.is_ok());
+        let bytes = result.unwrap();
+        // Should parse as a valid Type 3 message
+        let msg = Message::try_from(bytes.as_slice()).unwrap();
+        match msg {
+            Message::Authenticate(auth) => {
+                assert_eq!(auth.domain_name, "Domain");
+                assert_eq!(auth.user_name, "User");
+                assert_eq!(auth.mic, None); // no MIC since no timestamp/flags in target_info
+            }
+            _ => panic!("expected Authenticate message"),
+        }
+    }
+
+    #[test]
+    fn test_builder_with_cbt() {
+        let creds = Credentials {
+            username: "User".to_owned(),
+            password: "Password".to_owned(),
+            domain: "Domain".to_owned(),
+        };
+
+        let challenge = [0x01; 8];
+        let target_info_entries = vec![
+            TargetInfoEntry::from_string(TargetInfoType::NtDomain, "TEST"),
+            TargetInfoEntry {
+                entry_type: TargetInfoType::Terminator,
+                data: Vec::new(),
+            },
+        ];
+        let target_info = serialize_target_info(&target_info_entries);
+        let cert_der = b"test-certificate";
+
+        let bytes = NtlmV2Builder::new(challenge, &target_info, 0, &creds)
+            .channel_binding(cert_der)
+            .client_challenge([0x02; 8])
+            .build()
+            .unwrap();
+
+        let msg = Message::try_from(bytes.as_slice()).unwrap();
+        match msg {
+            Message::Authenticate(auth) => {
+                // Extract target info from NTLMv2 response blob
+                let temp = &auth.ntlm_response[16..];
+                let ti_offset = 28; // version(2) + reserved(6) + time(8) + challenge(8) + reserved(4)
+                let ti_end = temp.len() - 4;
+                let ti_bytes = &temp[ti_offset..ti_end];
+
+                let entries = parse_target_info(ti_bytes).unwrap();
+                let has_cbt = entries
+                    .iter()
+                    .any(|e| e.entry_type == TargetInfoType::ChannelBindings);
+                let has_flags = entries
+                    .iter()
+                    .any(|e| e.entry_type == TargetInfoType::Flags);
+                assert!(has_cbt);
+                assert!(has_flags);
+
+                let expected_cbt = compute_channel_bindings_hash(cert_der);
+                let cbt_entry = entries
+                    .iter()
+                    .find(|e| e.entry_type == TargetInfoType::ChannelBindings)
+                    .unwrap();
+                assert_eq!(cbt_entry.data, expected_cbt);
+            }
+            _ => panic!("expected Authenticate message"),
+        }
+    }
+
+    #[test]
+    fn test_builder_with_mic() {
+        let creds = Credentials {
+            username: "User".to_owned(),
+            password: "Password".to_owned(),
+            domain: "Domain".to_owned(),
+        };
+
+        let challenge = [0x01; 8];
+        let target_info_entries = vec![
+            TargetInfoEntry::from_string(TargetInfoType::NtDomain, "TEST"),
+            TargetInfoEntry {
+                entry_type: TargetInfoType::Timestamp,
+                data: 0i64.to_le_bytes().to_vec(),
+            },
+            TargetInfoEntry {
+                entry_type: TargetInfoType::Terminator,
+                data: Vec::new(),
+            },
+        ];
+        let target_info = serialize_target_info(&target_info_entries);
+
+        let nego_msg = Message::Negotiate(NegotiateMessage {
+            flags: Flags::NEGOTIATE_UNICODE | Flags::NEGOTIATE_NTLM,
+            supplied_domain: String::new(),
+            supplied_workstation: String::new(),
+            os_version: Default::default(),
+        });
+        let nego_bytes = nego_msg.to_bytes().unwrap();
+
+        let chal_msg = Message::Challenge(ChallengeMessage {
+            target_name: "TEST".to_owned(),
+            flags: Flags::NEGOTIATE_UNICODE | Flags::NEGOTIATE_NTLM,
+            challenge: [0x01; 8],
+            context: (0, 0),
+            target_information: target_info_entries.clone(),
+            os_version: Default::default(),
+        });
+        let chal_bytes = chal_msg.to_bytes().unwrap();
+
+        let bytes = NtlmV2Builder::new(challenge, &target_info, 0, &creds)
+            .mic(&nego_bytes, &chal_bytes)
+            .client_challenge([0x02; 8])
+            .build()
+            .unwrap();
+
+        let mic_bytes = &bytes[AuthenticateMessage::MIC_OFFSET
+            ..AuthenticateMessage::MIC_OFFSET + AuthenticateMessage::MIC_LENGTH];
+        assert_ne!(mic_bytes, &[0u8; 16]);
+
+        let msg = Message::try_from(bytes.as_slice()).unwrap();
+        match msg {
+            Message::Authenticate(auth) => {
+                assert!(auth.mic.is_some());
+            }
+            _ => panic!("expected Authenticate message"),
+        }
+    }
+
+    #[test]
+    fn test_builder_mic_required_but_not_provided() {
+        let creds = Credentials {
+            username: "User".to_owned(),
+            password: "Password".to_owned(),
+            domain: "Domain".to_owned(),
+        };
+
+        let challenge = [0x01; 8];
+        let target_info_entries = vec![
+            TargetInfoEntry {
+                entry_type: TargetInfoType::Flags,
+                data: AV_FLAGS_MIC_PROVIDED.to_le_bytes().to_vec(),
+            },
+            TargetInfoEntry {
+                entry_type: TargetInfoType::Terminator,
+                data: Vec::new(),
+            },
+        ];
+        let target_info = serialize_target_info(&target_info_entries);
+
+        let result = NtlmV2Builder::new(challenge, &target_info, 0, &creds)
+            .client_challenge([0x02; 8])
+            .build();
+
+        assert!(matches!(
+            result,
+            Err(BuildError::MicRequiredButMessagesNotProvided)
+        ));
+    }
+
+    #[test]
+    fn test_builder_timestamp_only_does_not_require_mic() {
+        let creds = Credentials {
+            username: "User".to_owned(),
+            password: "Password".to_owned(),
+            domain: "Domain".to_owned(),
+        };
+
+        let challenge = [0x01; 8];
+        let target_info_entries = vec![
+            TargetInfoEntry::from_string(TargetInfoType::NtDomain, "TEST"),
+            TargetInfoEntry {
+                entry_type: TargetInfoType::Timestamp,
+                data: 0i64.to_le_bytes().to_vec(),
+            },
+            TargetInfoEntry {
+                entry_type: TargetInfoType::Terminator,
+                data: Vec::new(),
+            },
+        ];
+        let target_info = serialize_target_info(&target_info_entries);
+
+        let result = NtlmV2Builder::new(challenge, &target_info, 0, &creds)
+            .client_challenge([0x02; 8])
+            .build();
+
+        assert!(result.is_ok());
+        let msg = Message::try_from(result.unwrap().as_slice()).unwrap();
+        match msg {
+            Message::Authenticate(auth) => assert_eq!(auth.mic, None),
+            _ => panic!("expected Authenticate"),
+        }
+    }
+
+    #[test]
+    fn test_target_info_parse_serialize_round_trip() {
+        let entries = vec![
+            TargetInfoEntry::from_string(TargetInfoType::NtDomain, "TESTDOMAIN"),
+            TargetInfoEntry::from_string(TargetInfoType::DnsDomain, "testdomain.local"),
+            TargetInfoEntry::from_string(TargetInfoType::DnsServer, "server.testdomain.local"),
+            TargetInfoEntry {
+                entry_type: TargetInfoType::Timestamp,
+                data: 132456789i64.to_le_bytes().to_vec(),
+            },
+            TargetInfoEntry {
+                entry_type: TargetInfoType::Terminator,
+                data: Vec::new(),
+            },
+        ];
+
+        let bytes = serialize_target_info(&entries);
+        let parsed = parse_target_info(&bytes).unwrap();
+        assert_eq!(entries, parsed);
+    }
+
+    #[test]
+    fn test_builder_with_cbt_and_mic() {
+        let creds = Credentials {
+            username: "User".to_owned(),
+            password: "Password".to_owned(),
+            domain: "Domain".to_owned(),
+        };
+
+        let challenge = [0x01; 8];
+        let target_info_entries = vec![
+            TargetInfoEntry::from_string(TargetInfoType::NtDomain, "TEST"),
+            TargetInfoEntry::from_string(TargetInfoType::DnsDomain, "test.local"),
+            TargetInfoEntry {
+                entry_type: TargetInfoType::Timestamp,
+                data: get_ntlm_time().to_le_bytes().to_vec(),
+            },
+            TargetInfoEntry {
+                entry_type: TargetInfoType::Terminator,
+                data: Vec::new(),
+            },
+        ];
+        let target_info = serialize_target_info(&target_info_entries);
+        let cert_der = b"test-server-certificate-der-bytes";
+
+        let nego_msg = Message::Negotiate(NegotiateMessage {
+            flags: Flags::NEGOTIATE_UNICODE | Flags::NEGOTIATE_NTLM,
+            supplied_domain: String::new(),
+            supplied_workstation: String::new(),
+            os_version: Default::default(),
+        });
+        let nego_bytes = nego_msg.to_bytes().unwrap();
+
+        let chal_msg = Message::Challenge(ChallengeMessage {
+            target_name: "TEST".to_owned(),
+            flags: Flags::NEGOTIATE_UNICODE | Flags::NEGOTIATE_NTLM,
+            challenge,
+            context: (0, 0),
+            target_information: target_info_entries.clone(),
+            os_version: Default::default(),
+        });
+        let chal_bytes = chal_msg.to_bytes().unwrap();
+
+        let bytes = NtlmV2Builder::new(challenge, &target_info, get_ntlm_time(), &creds)
+            .channel_binding(cert_der)
+            .mic(&nego_bytes, &chal_bytes)
+            .client_challenge([0x03; 8])
+            .build()
+            .unwrap();
+
+        let msg = Message::try_from(bytes.as_slice()).unwrap();
+        match msg {
+            Message::Authenticate(auth) => {
+                assert!(auth.mic.is_some());
+
+                let temp = &auth.ntlm_response[16..];
+                let ti_offset = 28;
+                let ti_end = temp.len() - 4;
+                let ti_bytes = &temp[ti_offset..ti_end];
+                let entries = parse_target_info(ti_bytes).unwrap();
+
+                let has_cbt = entries
+                    .iter()
+                    .any(|e| e.entry_type == TargetInfoType::ChannelBindings);
+                assert!(has_cbt);
+
+                let flags_entry = entries
+                    .iter()
+                    .find(|e| e.entry_type == TargetInfoType::Flags)
+                    .expect("Flags entry missing");
+                let flags_val = u32::from_le_bytes(flags_entry.data[..].try_into().unwrap());
+                assert_ne!(flags_val & AV_FLAGS_MIC_PROVIDED, 0);
+            }
+            _ => panic!("expected Authenticate message"),
+        }
+    }
+
+    #[test]
+    fn test_mic_verification() {
+        let creds = Credentials {
+            username: "User".to_owned(),
+            password: "Password".to_owned(),
+            domain: "Domain".to_owned(),
+        };
+
+        let challenge = [0x01; 8];
+        let target_info_entries = vec![
+            TargetInfoEntry::from_string(TargetInfoType::NtDomain, "TEST"),
+            TargetInfoEntry {
+                entry_type: TargetInfoType::Timestamp,
+                data: 0i64.to_le_bytes().to_vec(),
+            },
+            TargetInfoEntry {
+                entry_type: TargetInfoType::Terminator,
+                data: Vec::new(),
+            },
+        ];
+        let target_info = serialize_target_info(&target_info_entries);
+
+        let nego_msg = Message::Negotiate(NegotiateMessage {
+            flags: Flags::NEGOTIATE_UNICODE | Flags::NEGOTIATE_NTLM,
+            supplied_domain: String::new(),
+            supplied_workstation: String::new(),
+            os_version: Default::default(),
+        });
+        let nego_bytes = nego_msg.to_bytes().unwrap();
+
+        let chal_msg = Message::Challenge(ChallengeMessage {
+            target_name: "TEST".to_owned(),
+            flags: Flags::NEGOTIATE_UNICODE | Flags::NEGOTIATE_NTLM,
+            challenge,
+            context: (0, 0),
+            target_information: target_info_entries.clone(),
+            os_version: Default::default(),
+        });
+        let chal_bytes = chal_msg.to_bytes().unwrap();
+
+        let msg_bytes = NtlmV2Builder::new(challenge, &target_info, 0, &creds)
+            .mic(&nego_bytes, &chal_bytes)
+            .client_challenge([0x02; 8])
+            .build()
+            .unwrap();
+
+        let original_mic: [u8; 16] = msg_bytes[AuthenticateMessage::MIC_OFFSET
+            ..AuthenticateMessage::MIC_OFFSET + AuthenticateMessage::MIC_LENGTH]
+            .try_into()
+            .unwrap();
+        assert_ne!(original_mic, [0u8; 16]);
+
+        // Derive SessionBaseKey independently (simulating server-side)
+        let parsed = Message::try_from(msg_bytes.as_slice()).unwrap();
+        let auth = match &parsed {
+            Message::Authenticate(auth) => auth,
+            _ => panic!("expected Authenticate message"),
+        };
+        assert!(auth.session_key.is_empty());
+
+        let ntlm_key = ntlm_v2_password_func(&creds);
+        let nt_proof_string = &auth.ntlm_response[..16];
+        let mut hmac_sk: Hmac<Md5> = <Hmac<Md5> as Mac>::new_from_slice(&ntlm_key).unwrap();
+        hmac_sk.update(nt_proof_string);
+        let session_key: Vec<u8> = Vec::from(hmac_sk.finalize().into_bytes().as_slice());
+
+        // Zero the MIC and recompute
+        let mut verify_bytes = msg_bytes.clone();
+        verify_bytes[AuthenticateMessage::MIC_OFFSET
+            ..AuthenticateMessage::MIC_OFFSET + AuthenticateMessage::MIC_LENGTH]
+            .fill(0);
+
+        let mut hmac_md5: Hmac<Md5> = <Hmac<Md5> as Mac>::new_from_slice(&session_key).unwrap();
+        hmac_md5.update(&nego_bytes);
+        hmac_md5.update(&chal_bytes);
+        hmac_md5.update(&verify_bytes);
+        let recomputed_mic: [u8; 16] = hmac_md5.finalize().into_bytes().into();
+
+        assert_eq!(
+            original_mic, recomputed_mic,
+            "MIC verification failed: recomputed MIC doesn't match"
+        );
+    }
+
+    #[test]
+    fn test_lm_response_z24_when_timestamp_present() {
+        let creds = Credentials {
+            username: "user".to_owned(),
+            password: "pass".to_owned(),
+            domain: "DOMAIN".to_owned(),
+        };
+        let challenge = [0x01; 8];
+        let target_info_entries = vec![
+            TargetInfoEntry::from_string(TargetInfoType::NtDomain, "TEST"),
+            TargetInfoEntry {
+                entry_type: TargetInfoType::Timestamp,
+                data: 132456789012345678i64.to_le_bytes().to_vec(),
+            },
+            TargetInfoEntry {
+                entry_type: TargetInfoType::Terminator,
+                data: Vec::new(),
+            },
+        ];
+        let target_info = serialize_target_info(&target_info_entries);
+
+        let nego_msg = Message::Negotiate(NegotiateMessage {
+            flags: Flags::NEGOTIATE_UNICODE | Flags::NEGOTIATE_NTLM,
+            supplied_domain: String::new(),
+            supplied_workstation: String::new(),
+            os_version: Default::default(),
+        });
+        let nego_bytes = nego_msg.to_bytes().unwrap();
+
+        let chal_msg = Message::Challenge(ChallengeMessage {
+            target_name: "TEST".to_owned(),
+            flags: Flags::NEGOTIATE_UNICODE | Flags::NEGOTIATE_NTLM,
+            challenge,
+            context: (0, 0),
+            target_information: target_info_entries.clone(),
+            os_version: Default::default(),
+        });
+        let chal_bytes = chal_msg.to_bytes().unwrap();
+
+        let msg_bytes = NtlmV2Builder::new(challenge, &target_info, 0, &creds)
+            .mic(&nego_bytes, &chal_bytes)
+            .client_challenge([0x02; 8])
+            .build()
+            .unwrap();
+
+        let parsed = Message::try_from(msg_bytes.as_slice()).unwrap();
+        let auth = match &parsed {
+            Message::Authenticate(a) => a,
+            _ => panic!("expected Authenticate"),
+        };
+        assert_eq!(auth.lm_response, vec![0u8; 24]);
+
+        // Also verify via build_response()
+        let response = NtlmV2Builder::new(challenge, &target_info, 0, &creds)
+            .client_challenge([0x02; 8])
+            .build_response()
+            .unwrap();
+        assert_eq!(response.lm_response, vec![0u8; 24]);
+    }
+
+    #[test]
+    fn test_lm_response_normal_when_no_timestamp() {
+        let creds = Credentials {
+            username: "user".to_owned(),
+            password: "pass".to_owned(),
+            domain: "DOMAIN".to_owned(),
+        };
+        let challenge = [0x01; 8];
+        let client_challenge = [0x02; 8];
+        let target_info_entries = vec![
+            TargetInfoEntry::from_string(TargetInfoType::NtDomain, "TEST"),
+            TargetInfoEntry {
+                entry_type: TargetInfoType::Terminator,
+                data: Vec::new(),
+            },
+        ];
+        let target_info = serialize_target_info(&target_info_entries);
+
+        let response = NtlmV2Builder::new(challenge, &target_info, 0, &creds)
+            .client_challenge(client_challenge)
+            .build_response()
+            .unwrap();
+
+        assert_eq!(response.lm_response.len(), 24);
+        assert_eq!(&response.lm_response[16..24], &client_challenge);
+        assert_ne!(response.lm_response, vec![0u8; 24]);
+    }
+
+    #[test]
+    fn test_key_exch_encrypted_random_session_key() {
+        let creds = Credentials {
+            username: "User".to_owned(),
+            password: "Password".to_owned(),
+            domain: "Domain".to_owned(),
+        };
+        let challenge = [0x01; 8];
+        let target_info_entries = vec![
+            TargetInfoEntry::from_string(TargetInfoType::NtDomain, "TEST"),
+            TargetInfoEntry {
+                entry_type: TargetInfoType::Terminator,
+                data: Vec::new(),
+            },
+        ];
+        let target_info = serialize_target_info(&target_info_entries);
+
+        let fixed_esk = [0xAA; 16];
+
+        let flags = Flags::NEGOTIATE_UNICODE
+            | Flags::NEGOTIATE_NTLM
+            | Flags::NEGOTIATE_KEY_EXCHANGE
+            | Flags::NEGOTIATE_SIGN;
+
+        let msg_bytes = NtlmV2Builder::new(challenge, &target_info, 0, &creds)
+            .flags(flags)
+            .client_challenge([0x02; 8])
+            .exported_session_key(fixed_esk)
+            .build()
+            .unwrap();
+
+        let parsed = Message::try_from(msg_bytes.as_slice()).unwrap();
+        let auth = match &parsed {
+            Message::Authenticate(auth) => auth,
+            _ => panic!("expected Authenticate message"),
+        };
+
+        assert_eq!(auth.session_key.len(), 16);
+
+        // Derive SessionBaseKey and verify round-trip
+        let ntlm_key = ntlm_v2_password_func(&creds);
+        let nt_proof_string = &auth.ntlm_response[..16];
+        let mut hmac_sk: Hmac<Md5> = <Hmac<Md5> as Mac>::new_from_slice(&ntlm_key).unwrap();
+        hmac_sk.update(nt_proof_string);
+        let session_base_key: Vec<u8> = Vec::from(hmac_sk.finalize().into_bytes().as_slice());
+
+        let mut decrypted_esk = auth.session_key.clone();
+        let key = rc4::Key::<rc4::consts::U16>::from_slice(&session_base_key);
+        let mut rc4: Rc4<rc4::consts::U16> = <Rc4<rc4::consts::U16> as cipher::KeyInit>::new(key);
+        rc4.apply_keystream(&mut decrypted_esk);
+
+        assert_eq!(decrypted_esk, fixed_esk.to_vec());
+    }
+
+    #[test]
+    fn test_key_exch_inactive_without_sign_or_seal() {
+        // KEY_EXCH requires SIGN or SEAL to activate; without them, session_key is empty
+        let creds = Credentials {
+            username: "User".to_owned(),
+            password: "Password".to_owned(),
+            domain: "Domain".to_owned(),
+        };
+        let challenge = [0x01; 8];
+        let target_info_entries = vec![
+            TargetInfoEntry::from_string(TargetInfoType::NtDomain, "TEST"),
+            TargetInfoEntry {
+                entry_type: TargetInfoType::Terminator,
+                data: Vec::new(),
+            },
+        ];
+        let target_info = serialize_target_info(&target_info_entries);
+
+        // Case 1: KEY_EXCH set but no SIGN/SEAL
+        let flags =
+            Flags::NEGOTIATE_UNICODE | Flags::NEGOTIATE_NTLM | Flags::NEGOTIATE_KEY_EXCHANGE;
+        let bytes = NtlmV2Builder::new(challenge, &target_info, 0, &creds)
+            .flags(flags)
+            .client_challenge([0x02; 8])
+            .build()
+            .unwrap();
+        let auth = match Message::try_from(bytes.as_slice()).unwrap() {
+            Message::Authenticate(a) => a,
+            _ => panic!("expected Authenticate"),
+        };
+        assert!(auth.session_key.is_empty());
+
+        // Case 2: no KEY_EXCH at all
+        let bytes = NtlmV2Builder::new(challenge, &target_info, 0, &creds)
+            .client_challenge([0x02; 8])
+            .build()
+            .unwrap();
+        let auth = match Message::try_from(bytes.as_slice()).unwrap() {
+            Message::Authenticate(a) => a,
+            _ => panic!("expected Authenticate"),
+        };
+        assert!(auth.session_key.is_empty());
+    }
+
+    #[test]
+    fn test_key_exch_mic_uses_exported_session_key() {
+        let creds = Credentials {
+            username: "User".to_owned(),
+            password: "Password".to_owned(),
+            domain: "Domain".to_owned(),
+        };
+        let challenge = [0x01; 8];
+        let target_info_entries = vec![
+            TargetInfoEntry::from_string(TargetInfoType::NtDomain, "TEST"),
+            TargetInfoEntry {
+                entry_type: TargetInfoType::Timestamp,
+                data: 0i64.to_le_bytes().to_vec(),
+            },
+            TargetInfoEntry {
+                entry_type: TargetInfoType::Terminator,
+                data: Vec::new(),
+            },
+        ];
+        let target_info = serialize_target_info(&target_info_entries);
+
+        let fixed_esk = [0xBB; 16];
+
+        let flags = Flags::NEGOTIATE_UNICODE
+            | Flags::NEGOTIATE_NTLM
+            | Flags::NEGOTIATE_KEY_EXCHANGE
+            | Flags::NEGOTIATE_SEAL;
+
+        let nego_msg = Message::Negotiate(NegotiateMessage {
+            flags,
+            supplied_domain: String::new(),
+            supplied_workstation: String::new(),
+            os_version: Default::default(),
+        });
+        let nego_bytes = nego_msg.to_bytes().unwrap();
+
+        let chal_msg = Message::Challenge(ChallengeMessage {
+            target_name: "TEST".to_owned(),
+            flags,
+            challenge,
+            context: (0, 0),
+            target_information: target_info_entries.clone(),
+            os_version: Default::default(),
+        });
+        let chal_bytes = chal_msg.to_bytes().unwrap();
+
+        let msg_bytes = NtlmV2Builder::new(challenge, &target_info, 0, &creds)
+            .flags(flags)
+            .mic(&nego_bytes, &chal_bytes)
+            .client_challenge([0x02; 8])
+            .exported_session_key(fixed_esk)
+            .build()
+            .unwrap();
+
+        let original_mic: [u8; 16] = msg_bytes[AuthenticateMessage::MIC_OFFSET
+            ..AuthenticateMessage::MIC_OFFSET + AuthenticateMessage::MIC_LENGTH]
+            .try_into()
+            .unwrap();
+        assert_ne!(original_mic, [0u8; 16]);
+
+        // Verify with ExportedSessionKey
+        let mut verify_bytes = msg_bytes.clone();
+        verify_bytes[AuthenticateMessage::MIC_OFFSET
+            ..AuthenticateMessage::MIC_OFFSET + AuthenticateMessage::MIC_LENGTH]
+            .fill(0);
+
+        let mut hmac_md5: Hmac<Md5> = <Hmac<Md5> as Mac>::new_from_slice(&fixed_esk).unwrap();
+        hmac_md5.update(&nego_bytes);
+        hmac_md5.update(&chal_bytes);
+        hmac_md5.update(&verify_bytes);
+        let recomputed_mic: [u8; 16] = hmac_md5.finalize().into_bytes().into();
+
+        assert_eq!(original_mic, recomputed_mic);
+
+        // Verify that SessionBaseKey (wrong key) does NOT match
+        let parsed = Message::try_from(msg_bytes.as_slice()).unwrap();
+        let auth = match &parsed {
+            Message::Authenticate(auth) => auth,
+            _ => panic!("expected Authenticate message"),
+        };
+
+        let ntlm_key = ntlm_v2_password_func(&creds);
+        let nt_proof_string = &auth.ntlm_response[..16];
+        let mut hmac_sk: Hmac<Md5> = <Hmac<Md5> as Mac>::new_from_slice(&ntlm_key).unwrap();
+        hmac_sk.update(nt_proof_string);
+        let session_base_key: Vec<u8> = Vec::from(hmac_sk.finalize().into_bytes().as_slice());
+
+        let mut hmac_wrong: Hmac<Md5> =
+            <Hmac<Md5> as Mac>::new_from_slice(&session_base_key).unwrap();
+        hmac_wrong.update(&nego_bytes);
+        hmac_wrong.update(&chal_bytes);
+        hmac_wrong.update(&verify_bytes);
+        let wrong_mic: [u8; 16] = hmac_wrong.finalize().into_bytes().into();
+
+        assert_ne!(original_mic, wrong_mic);
+    }
+
+    #[test]
+    fn test_key_exch_server_side_verification() {
+        let creds = Credentials {
+            username: "TestUser".to_owned(),
+            password: "SecretPassword123".to_owned(),
+            domain: "TESTDOMAIN".to_owned(),
+        };
+        let challenge = [0x55; 8];
+        let target_info_entries = vec![
+            TargetInfoEntry::from_string(TargetInfoType::NtDomain, "TESTDOMAIN"),
+            TargetInfoEntry::from_string(TargetInfoType::DnsDomain, "testdomain.local"),
+            TargetInfoEntry {
+                entry_type: TargetInfoType::Timestamp,
+                data: 132500000000000000i64.to_le_bytes().to_vec(),
+            },
+            TargetInfoEntry {
+                entry_type: TargetInfoType::Terminator,
+                data: Vec::new(),
+            },
+        ];
+        let target_info = serialize_target_info(&target_info_entries);
+
+        let flags = Flags::NEGOTIATE_UNICODE
+            | Flags::NEGOTIATE_NTLM
+            | Flags::NEGOTIATE_KEY_EXCHANGE
+            | Flags::NEGOTIATE_SIGN
+            | Flags::NEGOTIATE_SEAL
+            | Flags::NEGOTIATE_128BIT
+            | Flags::NEGOTIATE_ALWAYS_SIGN;
+
+        let nego_msg = Message::Negotiate(NegotiateMessage {
+            flags,
+            supplied_domain: String::new(),
+            supplied_workstation: String::new(),
+            os_version: Default::default(),
+        });
+        let nego_bytes = nego_msg.to_bytes().unwrap();
+
+        let chal_msg = Message::Challenge(ChallengeMessage {
+            target_name: "TESTDOMAIN".to_owned(),
+            flags,
+            challenge,
+            context: (0, 0),
+            target_information: target_info_entries.clone(),
+            os_version: Default::default(),
+        });
+        let chal_bytes = chal_msg.to_bytes().unwrap();
+
+        let msg_bytes = NtlmV2Builder::new(challenge, &target_info, 132500000000000000, &creds)
+            .flags(flags)
+            .mic(&nego_bytes, &chal_bytes)
+            .client_challenge([0x33; 8])
+            .build()
+            .unwrap();
+
+        // Server-side: derive SessionBaseKey, decrypt ExportedSessionKey, verify MIC
+        let parsed = Message::try_from(msg_bytes.as_slice()).unwrap();
+        let auth = match &parsed {
+            Message::Authenticate(auth) => auth,
+            _ => panic!("expected Authenticate message"),
+        };
+
+        let ntlm_key = ntlm_v2_password_func(&creds);
+        let nt_proof_string = &auth.ntlm_response[..16];
+        let mut hmac_sk: Hmac<Md5> = <Hmac<Md5> as Mac>::new_from_slice(&ntlm_key).unwrap();
+        hmac_sk.update(nt_proof_string);
+        let session_base_key: Vec<u8> = Vec::from(hmac_sk.finalize().into_bytes().as_slice());
+
+        assert_eq!(auth.session_key.len(), 16);
+        let mut exported_session_key = auth.session_key.clone();
+        let key = rc4::Key::<rc4::consts::U16>::from_slice(&session_base_key);
+        let mut rc4: Rc4<rc4::consts::U16> = <Rc4<rc4::consts::U16> as cipher::KeyInit>::new(key);
+        rc4.apply_keystream(&mut exported_session_key);
+
+        let original_mic: [u8; 16] = msg_bytes[AuthenticateMessage::MIC_OFFSET
+            ..AuthenticateMessage::MIC_OFFSET + AuthenticateMessage::MIC_LENGTH]
+            .try_into()
+            .unwrap();
+
+        let mut verify_bytes = msg_bytes.clone();
+        verify_bytes[AuthenticateMessage::MIC_OFFSET
+            ..AuthenticateMessage::MIC_OFFSET + AuthenticateMessage::MIC_LENGTH]
+            .fill(0);
+
+        let mut hmac_md5: Hmac<Md5> =
+            <Hmac<Md5> as Mac>::new_from_slice(&exported_session_key).unwrap();
+        hmac_md5.update(&nego_bytes);
+        hmac_md5.update(&chal_bytes);
+        hmac_md5.update(&verify_bytes);
+        let recomputed_mic: [u8; 16] = hmac_md5.finalize().into_bytes().into();
+
+        assert_eq!(original_mic, recomputed_mic);
     }
 }
