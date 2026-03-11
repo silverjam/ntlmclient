@@ -4,12 +4,10 @@
 //! provides functions to convert between this character set and Unicode. We use these to convert
 //! between ANSI strings (represented as `Vec<u8>`) and Rust strings (decoded from UTF-16).
 
-
 use windows::Win32::Globalization::{
-    CP_ACP, MB_ERR_INVALID_CHARS, MB_PRECOMPOSED, MultiByteToWideChar, WC_COMPOSITECHECK,
-    WideCharToMultiByte,
+    MultiByteToWideChar, WideCharToMultiByte, CP_ACP, MB_ERR_INVALID_CHARS, MB_PRECOMPOSED,
+    WC_COMPOSITECHECK,
 };
-
 
 /// Converts the given ANSI string into a Rust string.
 pub fn ansi_string_to_rust(ansi_string: &[u8]) -> Option<String> {
@@ -53,7 +51,6 @@ pub fn ansi_string_to_rust(ansi_string: &[u8]) -> Option<String> {
     String::from_utf16(&buf).ok()
 }
 
-
 /// Converts the given Rust string into an ANSI string.
 pub fn rust_string_to_ansi(rust_str: &str) -> Option<Vec<u8>> {
     if rust_str.len() == 0 {
@@ -65,16 +62,8 @@ pub fn rust_string_to_ansi(rust_str: &str) -> Option<Vec<u8>> {
 
     // then, convert to the ANSI codepage
     // how many bytes will we require?
-    let byte_count = unsafe {
-        WideCharToMultiByte(
-            CP_ACP,
-            WC_COMPOSITECHECK,
-            &unicode,
-            None,
-            None,
-            None,
-        )
-    };
+    let byte_count =
+        unsafe { WideCharToMultiByte(CP_ACP, WC_COMPOSITECHECK, &unicode, None, None, None) };
     let byte_count_usize: usize = byte_count.try_into().ok()?;
     if byte_count_usize == 0 {
         return None;

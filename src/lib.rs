@@ -99,28 +99,26 @@
 //! }
 //! ```
 
-
 #[cfg(windows)]
 mod encoding_windows;
 
 #[cfg(not(windows))]
 mod encoding_utf8;
 
-
 use std::fmt;
 
 use bitflags::bitflags;
 use chrono::{NaiveDate, Utc};
-use cipher::{BlockEncrypt, KeyInit};
-use cipher::generic_array::GenericArray;
 use cipher::generic_array::typenum::U8;
+use cipher::generic_array::GenericArray;
+use cipher::{BlockEncrypt, KeyInit};
 use des::Des;
 use digest::Digest;
 use hmac::{Hmac, Mac};
 use md4::Md4;
 use md5::Md5;
-use rand::Rng;
 use rand::rngs::OsRng;
+use rand::Rng;
 
 #[cfg(windows)]
 use crate::encoding_windows::{ansi_string_to_rust, rust_string_to_ansi};
@@ -128,10 +126,8 @@ use crate::encoding_windows::{ansi_string_to_rust, rust_string_to_ansi};
 #[cfg(not(windows))]
 use crate::encoding_utf8::{ansi_string_to_rust, rust_string_to_ansi};
 
-
 /// The magic value at the start of every NTLMSSP data packet.
 const NTLMSSP_MAGIC: [u8; 8] = *b"NTLMSSP\0";
-
 
 /// Standard NTLM credentials, consisting of username, password and domain.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -161,7 +157,6 @@ pub struct ChallengeResponse {
     /// The session key, generally calculated from elements of the responses.
     pub session_key: Vec<u8>,
 }
-
 
 bitflags! {
     /// NTLM operation flags.
@@ -202,24 +197,35 @@ bitflags! {
     }
 }
 
-
 /// An error that may occur while parsing existing NTLM packets.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ParsingError {
     /// The header is shorter than expected.
-    ShortHeader { expected_min_len: usize, obtained_len: usize },
+    ShortHeader {
+        expected_min_len: usize,
+        obtained_len: usize,
+    },
 
     /// The magic value does not match the expected one.
-    MagicMismatch { expected: [u8; 8], obtained: Vec<u8> },
+    MagicMismatch {
+        expected: [u8; 8],
+        obtained: Vec<u8>,
+    },
 
     /// An internal item has a different length than expected.
     ItemLengthMismatch { expected: usize, obtained: usize },
 
     /// An internal item is shorter than expected.
-    ItemMinLengthMismatch { expected_at_least: usize, obtained: usize },
+    ItemMinLengthMismatch {
+        expected_at_least: usize,
+        obtained: usize,
+    },
 
     /// An internal item's length is not divisible by an expected divisor.
-    ItemLengthNotDivisible { expected_divisor: usize, obtained_length: usize },
+    ItemLengthNotDivisible {
+        expected_divisor: usize,
+        obtained_length: usize,
+    },
 
     /// A byte string cannot be decoded using the current OEM encoding.
     InvalidOemEncoding { value: Vec<u8> },
@@ -272,8 +278,7 @@ impl fmt::Display for ParsingError {
         }
     }
 }
-impl std::error::Error for ParsingError {
-}
+impl std::error::Error for ParsingError {}
 
 /// An error that may occur while writing an NTLM packet.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -287,15 +292,16 @@ pub enum StoringError {
 impl fmt::Display for StoringError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NonOemEncodable { string }
-                => write!(f, "failed to encode {:?} using OEM encoding", string),
-            Self::NeitherUnicodeNorOem
-                => write!(f, "neither Unicode nor OEM encoding was selected"),
+            Self::NonOemEncodable { string } => {
+                write!(f, "failed to encode {:?} using OEM encoding", string)
+            }
+            Self::NeitherUnicodeNorOem => {
+                write!(f, "neither Unicode nor OEM encoding was selected")
+            }
         }
     }
 }
-impl std::error::Error for StoringError {
-}
+impl std::error::Error for StoringError {}
 
 /// An NTLM message.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -466,9 +472,7 @@ pub struct TargetInfoEntry {
     pub data: Vec<u8>,
 }
 
-
 // serialization and deserialization code
-
 
 /// Appends a security buffer to the end of a message.
 ///
@@ -476,7 +480,12 @@ pub struct TargetInfoEntry {
 /// `data_block`. It is assumed that once `message_bytes` has been filled with all the required
 /// information, the contents of `data_block` are appended to it. `sec_buffer_offset` takes care of
 /// the next free offset in the message at which data of a security buffer can be appended.
-fn append_sec_buffer(message_bytes: &mut Vec<u8>, data_block: &mut Vec<u8>, sec_buffer_offset: &mut u32, data: &[u8]) {
+fn append_sec_buffer(
+    message_bytes: &mut Vec<u8>,
+    data_block: &mut Vec<u8>,
+    sec_buffer_offset: &mut u32,
+    data: &[u8],
+) {
     // data_block will be placed at the end of the packet; fill it with the actual data
     data_block.extend_from_slice(data);
 
@@ -495,14 +504,19 @@ fn append_sec_buffer(message_bytes: &mut Vec<u8>, data_block: &mut Vec<u8>, sec_
 ///
 /// Functions similarly to [`append_sec_buffer`], but encodes the string in the expected format
 /// first.
-fn append_sec_buffer_string(packet_bytes: &mut Vec<u8>, data_block: &mut Vec<u8>, sec_buffer_offset: &mut u32, flags: Flags, data: &str) -> Result<(), StoringError> {
+fn append_sec_buffer_string(
+    packet_bytes: &mut Vec<u8>,
+    data_block: &mut Vec<u8>,
+    sec_buffer_offset: &mut u32,
+    flags: Flags,
+    data: &str,
+) -> Result<(), StoringError> {
     let bs = if flags.contains(Flags::NEGOTIATE_UNICODE) {
-        data.encode_utf16()
-            .flat_map(|w| w.to_le_bytes())
-            .collect()
+        data.encode_utf16().flat_map(|w| w.to_le_bytes()).collect()
     } else if flags.contains(Flags::NEGOTIATE_OEM) {
-        rust_string_to_ansi(data)
-            .ok_or_else(|| StoringError::NonOemEncodable { string: data.to_owned() })?
+        rust_string_to_ansi(data).ok_or_else(|| StoringError::NonOemEncodable {
+            string: data.to_owned(),
+        })?
     } else {
         return Err(StoringError::NeitherUnicodeNorOem);
     };
@@ -515,19 +529,23 @@ fn append_sec_buffer_string(packet_bytes: &mut Vec<u8>, data_block: &mut Vec<u8>
 /// Converts UTF-16 values stored as bytes in little-endian format into a string.
 fn utf16_le_bytes_to_string(bytes: &[u8]) -> Result<String, ParsingError> {
     if bytes.len() % 2 != 0 {
-        return Err(ParsingError::ItemLengthNotDivisible { expected_divisor: 2, obtained_length: bytes.len() });
+        return Err(ParsingError::ItemLengthNotDivisible {
+            expected_divisor: 2,
+            obtained_length: bytes.len(),
+        });
     }
-    let u16s: Vec<u16> = bytes.chunks_exact(2)
+    let u16s: Vec<u16> = bytes
+        .chunks_exact(2)
         .map(|chk| u16::from_le_bytes(chk.try_into().unwrap()))
         .collect();
-    String::from_utf16(&u16s)
-        .or(Err(ParsingError::InvalidUtf16{ value: u16s }))
+    String::from_utf16(&u16s).or(Err(ParsingError::InvalidUtf16 { value: u16s }))
 }
 
 /// Converts an ANSI string into a Rust string.
 fn oem_bytes_to_string(bytes: &[u8]) -> Result<String, ParsingError> {
-    ansi_string_to_rust(bytes)
-        .ok_or_else(|| ParsingError::InvalidOemEncoding { value: Vec::from(bytes) })
+    ansi_string_to_rust(bytes).ok_or_else(|| ParsingError::InvalidOemEncoding {
+        value: Vec::from(bytes),
+    })
 }
 
 /// Converts a string into a Rust string, using ANSI or UTF-16 encoding depending on the `flags`.
@@ -550,13 +568,13 @@ impl Message {
         match self {
             Message::Negotiate(t1m) => {
                 buf.extend_from_slice(&t1m.to_bytes()?);
-            },
+            }
             Message::Challenge(t2m) => {
                 buf.extend_from_slice(&t2m.to_bytes()?);
-            },
+            }
             Message::Authenticate(t3m) => {
                 buf.extend_from_slice(&t3m.to_bytes()?);
-            },
+            }
             Message::Other(_msg_num, data) => {
                 buf.extend_from_slice(data);
             }
@@ -570,20 +588,29 @@ impl TryFrom<&[u8]> for Message {
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
         if value.len() < 12 {
             // assume magic mismatch
-            return Err(ParsingError::ShortHeader { expected_min_len: 12, obtained_len: value.len() });
+            return Err(ParsingError::ShortHeader {
+                expected_min_len: 12,
+                obtained_len: value.len(),
+            });
         }
         let obtained_magic: [u8; 8] = value[0..8].try_into().unwrap();
         if obtained_magic != NTLMSSP_MAGIC {
-            return Err(ParsingError::MagicMismatch { expected: NTLMSSP_MAGIC, obtained: Vec::from(obtained_magic) });
+            return Err(ParsingError::MagicMismatch {
+                expected: NTLMSSP_MAGIC,
+                obtained: Vec::from(obtained_magic),
+            });
         }
         let message_type = u32::from_le_bytes(value[8..12].try_into().unwrap());
         match message_type {
-            0x0000_0001 => NegotiateMessage::try_from(&value[12..])
-                .map(|t1m| Message::Negotiate(t1m)),
-            0x0000_0002 => ChallengeMessage::try_from(&value[12..])
-                .map(|t2m| Message::Challenge(t2m)),
-            0x0000_0003 => AuthenticateMessage::try_from(&value[12..])
-                .map(|t3m| Message::Authenticate(t3m)),
+            0x0000_0001 => {
+                NegotiateMessage::try_from(&value[12..]).map(|t1m| Message::Negotiate(t1m))
+            }
+            0x0000_0002 => {
+                ChallengeMessage::try_from(&value[12..]).map(|t2m| Message::Challenge(t2m))
+            }
+            0x0000_0003 => {
+                AuthenticateMessage::try_from(&value[12..]).map(|t3m| Message::Authenticate(t3m))
+            }
             other_type => Ok(Message::Other(other_type, Vec::from(&value[12..]))),
         }
     }
@@ -606,7 +633,10 @@ impl TryFrom<&[u8]> for OsVersion {
 
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
         if value.len() != 8 {
-            return Err(ParsingError::ItemLengthMismatch { expected: 8, obtained: value.len() });
+            return Err(ParsingError::ItemLengthMismatch {
+                expected: 8,
+                obtained: value.len(),
+            });
         }
 
         let major_version = value[0];
@@ -641,8 +671,20 @@ impl NegotiateMessage {
         let mut data_block = Vec::new();
 
         ret.extend_from_slice(&self.flags.bits().to_le_bytes());
-        append_sec_buffer_string(&mut ret, &mut data_block, &mut sec_buffer_offset, self.flags, &self.supplied_domain)?;
-        append_sec_buffer_string(&mut ret, &mut data_block, &mut sec_buffer_offset, self.flags, &self.supplied_workstation)?;
+        append_sec_buffer_string(
+            &mut ret,
+            &mut data_block,
+            &mut sec_buffer_offset,
+            self.flags,
+            &self.supplied_domain,
+        )?;
+        append_sec_buffer_string(
+            &mut ret,
+            &mut data_block,
+            &mut sec_buffer_offset,
+            self.flags,
+            &self.supplied_workstation,
+        )?;
         ret.extend_from_slice(&self.os_version.to_bytes());
         ret.append(&mut data_block);
         Ok(ret)
@@ -655,7 +697,10 @@ impl TryFrom<&[u8]> for NegotiateMessage {
         // magic and message type have already been sliced away
 
         if value.len() < 32 {
-            return Err(ParsingError::ItemMinLengthMismatch { expected_at_least: 32, obtained: value.len() });
+            return Err(ParsingError::ItemMinLengthMismatch {
+                expected_at_least: 32,
+                obtained: value.len(),
+            });
         }
         let flags_u32 = u32::from_le_bytes(value[0..4].try_into().unwrap());
         let flags = Flags::from_bits(flags_u32).unwrap();
@@ -672,7 +717,8 @@ impl TryFrom<&[u8]> for NegotiateMessage {
         // however, magic and message type have already been sliced away
         // adjust offsets accordingly
         let supplied_domain_bytes = supplied_domain_secbuf.apply_to_slice(&value, -(8 + 4))?;
-        let supplied_workstation_bytes = supplied_workstation_secbuf.apply_to_slice(&value, -(8 + 4))?;
+        let supplied_workstation_bytes =
+            supplied_workstation_secbuf.apply_to_slice(&value, -(8 + 4))?;
 
         let supplied_domain = ntlm_bytes_to_string(flags, supplied_domain_bytes)?;
         let supplied_workstation = ntlm_bytes_to_string(flags, supplied_workstation_bytes)?;
@@ -703,16 +749,29 @@ impl ChallengeMessage {
         let mut ret = Vec::new();
         let mut data_block = Vec::new();
 
-        append_sec_buffer_string(&mut ret, &mut data_block, &mut sec_buffer_offset, self.flags, &self.target_name)?;
+        append_sec_buffer_string(
+            &mut ret,
+            &mut data_block,
+            &mut sec_buffer_offset,
+            self.flags,
+            &self.target_name,
+        )?;
         ret.extend_from_slice(&self.flags.bits().to_le_bytes());
         ret.extend_from_slice(&self.challenge);
         data_block.extend_from_slice(&self.context.0.to_le_bytes());
         data_block.extend_from_slice(&self.context.1.to_le_bytes());
         {
-            let target_info_bytes: Vec<u8> = self.target_information.iter()
+            let target_info_bytes: Vec<u8> = self
+                .target_information
+                .iter()
                 .flat_map(|ti| ti.to_bytes())
                 .collect();
-            append_sec_buffer(&mut ret, &mut data_block, &mut sec_buffer_offset, &target_info_bytes);
+            append_sec_buffer(
+                &mut ret,
+                &mut data_block,
+                &mut sec_buffer_offset,
+                &target_info_bytes,
+            );
         }
         ret.extend_from_slice(&self.os_version.to_bytes());
         ret.append(&mut data_block);
@@ -726,7 +785,10 @@ impl TryFrom<&[u8]> for ChallengeMessage {
         // magic and message type have already been sliced away
 
         if value.len() < 44 {
-            return Err(ParsingError::ItemMinLengthMismatch { expected_at_least: 44, obtained: value.len() });
+            return Err(ParsingError::ItemMinLengthMismatch {
+                expected_at_least: 44,
+                obtained: value.len(),
+            });
         }
         let target_name_secbuf = SecurityBuffer::try_from(&value[0..8]).unwrap();
         let flags_u32 = u32::from_le_bytes(value[8..12].try_into().unwrap());
@@ -789,12 +851,45 @@ impl AuthenticateMessage {
         let mut ret = Vec::new();
         let mut data_block = Vec::new();
 
-        append_sec_buffer(&mut ret, &mut data_block, &mut sec_buffer_offset, &self.lm_response);
-        append_sec_buffer(&mut ret, &mut data_block, &mut sec_buffer_offset, &self.ntlm_response);
-        append_sec_buffer_string(&mut ret, &mut data_block, &mut sec_buffer_offset, self.flags, &self.domain_name)?;
-        append_sec_buffer_string(&mut ret, &mut data_block, &mut sec_buffer_offset, self.flags, &self.user_name)?;
-        append_sec_buffer_string(&mut ret, &mut data_block, &mut sec_buffer_offset, self.flags, &self.workstation_name)?;
-        append_sec_buffer(&mut ret, &mut data_block, &mut sec_buffer_offset, &self.session_key);
+        append_sec_buffer(
+            &mut ret,
+            &mut data_block,
+            &mut sec_buffer_offset,
+            &self.lm_response,
+        );
+        append_sec_buffer(
+            &mut ret,
+            &mut data_block,
+            &mut sec_buffer_offset,
+            &self.ntlm_response,
+        );
+        append_sec_buffer_string(
+            &mut ret,
+            &mut data_block,
+            &mut sec_buffer_offset,
+            self.flags,
+            &self.domain_name,
+        )?;
+        append_sec_buffer_string(
+            &mut ret,
+            &mut data_block,
+            &mut sec_buffer_offset,
+            self.flags,
+            &self.user_name,
+        )?;
+        append_sec_buffer_string(
+            &mut ret,
+            &mut data_block,
+            &mut sec_buffer_offset,
+            self.flags,
+            &self.workstation_name,
+        )?;
+        append_sec_buffer(
+            &mut ret,
+            &mut data_block,
+            &mut sec_buffer_offset,
+            &self.session_key,
+        );
         ret.extend_from_slice(&self.flags.bits().to_le_bytes());
         ret.extend_from_slice(&self.os_version.to_bytes());
         ret.append(&mut data_block);
@@ -808,7 +903,10 @@ impl TryFrom<&[u8]> for AuthenticateMessage {
         // magic and message type have already been sliced away
 
         if value.len() < 60 {
-            return Err(ParsingError::ItemMinLengthMismatch { expected_at_least: 60, obtained: value.len() });
+            return Err(ParsingError::ItemMinLengthMismatch {
+                expected_at_least: 60,
+                obtained: value.len(),
+            });
         }
         let lm_response_secbuf = SecurityBuffer::try_from(&value[0..8]).unwrap();
         let ntlm_response_secbuf = SecurityBuffer::try_from(&value[8..16]).unwrap();
@@ -859,8 +957,10 @@ impl SecurityBuffer {
     ///
     /// The length and capacity are set to the length of the slice, while the offset is set to 0.
     pub fn for_slice(slice: &[u8]) -> Self {
-        let len_u16: u16 = slice.len()
-            .try_into().expect("buffer too long for u16 length");
+        let len_u16: u16 = slice
+            .len()
+            .try_into()
+            .expect("buffer too long for u16 length");
         Self {
             length: len_u16,
             capacity: len_u16,
@@ -881,32 +981,52 @@ impl SecurityBuffer {
     ///
     /// The data is assumed to be located in `slice` beginning at `self.offset`. In case leading
     /// fields have been removed from `slice`, the offset may be further adjusted through `adjust`.
-    pub fn apply_to_slice<'a>(&self, slice: &'a [u8], adjust: isize) -> Result<&'a [u8], ParsingError> {
+    pub fn apply_to_slice<'a>(
+        &self,
+        slice: &'a [u8],
+        adjust: isize,
+    ) -> Result<&'a [u8], ParsingError> {
         if self.length == 0 {
             // short-circuit
             return Ok(&slice[0..0]);
         }
 
-        let offset_isize: isize = self.offset.try_into()
+        let offset_isize: isize = self
+            .offset
+            .try_into()
             .or(Err(ParsingError::OffsetTooLargeIsize))?;
-        let length_isize: isize = self.length.try_into()
+        let length_isize: isize = self
+            .length
+            .try_into()
             .or(Err(ParsingError::LengthTooLargeIsize))?;
 
         if offset_isize + adjust < 0 {
-            return Err(ParsingError::StartOutOfRange { start: offset_isize + adjust, length: slice.len() });
+            return Err(ParsingError::StartOutOfRange {
+                start: offset_isize + adjust,
+                length: slice.len(),
+            });
         }
         if offset_isize + length_isize + adjust < 0 {
-            return Err(ParsingError::EndOutOfRange { end: offset_isize + length_isize + adjust, length: slice.len() });
+            return Err(ParsingError::EndOutOfRange {
+                end: offset_isize + length_isize + adjust,
+                length: slice.len(),
+            });
         }
 
         let start: usize = (offset_isize + adjust).try_into().unwrap();
         let end: usize = (offset_isize + length_isize + adjust).try_into().unwrap();
 
         if start >= slice.len() {
-            return Err(ParsingError::StartOutOfRange { start: offset_isize + adjust, length: slice.len() });
+            return Err(ParsingError::StartOutOfRange {
+                start: offset_isize + adjust,
+                length: slice.len(),
+            });
         }
         if end > slice.len() {
-            return Err(ParsingError::EndOutOfRange { end: offset_isize + length_isize + adjust, length: slice.len() });
+            return Err(ParsingError::EndOutOfRange {
+                end: offset_isize + length_isize + adjust,
+                length: slice.len(),
+            });
         }
 
         Ok(&slice[start..end])
@@ -917,7 +1037,10 @@ impl TryFrom<&[u8]> for SecurityBuffer {
 
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
         if value.len() != 8 {
-            return Err(ParsingError::ItemLengthMismatch { expected: 8, obtained: value.len() });
+            return Err(ParsingError::ItemLengthMismatch {
+                expected: 8,
+                obtained: value.len(),
+            });
         }
 
         let length = u16::from_le_bytes(value[0..2].try_into().unwrap());
@@ -939,7 +1062,11 @@ impl TargetInfoEntry {
 
         // always Unicode, even if flags claim OEM
         let entry_type_u16: u16 = self.entry_type.into();
-        let bytes_len: u16 = self.data.len().try_into().expect("length of bytes does not fit into u16");
+        let bytes_len: u16 = self
+            .data
+            .len()
+            .try_into()
+            .expect("length of bytes does not fit into u16");
 
         ret.extend_from_slice(&entry_type_u16.to_le_bytes());
         ret.extend_from_slice(&bytes_len.to_le_bytes());
@@ -952,7 +1079,10 @@ impl TargetInfoEntry {
     /// are not part of the freshly deserialized target info entry).
     pub fn try_from_bytes(bytes: &[u8]) -> Result<(Self, &[u8]), ParsingError> {
         if bytes.len() < 4 {
-            return Err(ParsingError::ItemMinLengthMismatch { expected_at_least: 4, obtained: bytes.len() });
+            return Err(ParsingError::ItemMinLengthMismatch {
+                expected_at_least: 4,
+                obtained: bytes.len(),
+            });
         }
 
         let entry_type_u16 = u16::from_le_bytes(bytes[0..2].try_into().unwrap());
@@ -961,19 +1091,22 @@ impl TargetInfoEntry {
         let length: usize = length_u16.into();
 
         if length + 4 > bytes.len() {
-            return Err(ParsingError::ItemMinLengthMismatch { expected_at_least: length + 4, obtained: bytes.len() });
+            return Err(ParsingError::ItemMinLengthMismatch {
+                expected_at_least: length + 4,
+                obtained: bytes.len(),
+            });
         }
         if length % 2 != 0 {
-            return Err(ParsingError::ItemLengthNotDivisible { expected_divisor: 2, obtained_length: bytes.len() });
+            return Err(ParsingError::ItemLengthNotDivisible {
+                expected_divisor: 2,
+                obtained_length: bytes.len(),
+            });
         }
 
-        let data = Vec::from(&bytes[4..4+length]);
+        let data = Vec::from(&bytes[4..4 + length]);
 
-        let entry = Self {
-            entry_type,
-            data,
-        };
-        let rest = &bytes[4+length..];
+        let entry = Self { entry_type, data };
+        let rest = &bytes[4 + length..];
         Ok((entry, rest))
     }
 
@@ -985,13 +1118,11 @@ impl TargetInfoEntry {
     /// Creates a target info entry from an entry type and a string.
     pub fn from_string(entry_type: TargetInfoType, string: &str) -> Self {
         // always Unicode, even if flags claim OEM
-        let data: Vec<u8> = string.encode_utf16()
+        let data: Vec<u8> = string
+            .encode_utf16()
             .flat_map(|b| b.to_le_bytes())
             .collect();
-        Self {
-            entry_type,
-            data,
-        }
+        Self { entry_type, data }
     }
 }
 
@@ -1011,22 +1142,20 @@ impl ChallengeResponse {
     }
 }
 
-
 // response calculation functions
-
 
 /// Obtains the current NTLM timestamp.
 pub fn get_ntlm_time() -> i64 {
     let windows_epoch = NaiveDate::from_ymd_opt(1601, 1, 1)
         .expect("1601-01-01 is not a valid date?!")
-        .and_hms_opt(0, 0, 0).expect("1601-01-01T00:00:00 is not a valid date-time?!")
+        .and_hms_opt(0, 0, 0)
+        .expect("1601-01-01T00:00:00 is not a valid date-time?!")
         .and_utc();
     let now = Utc::now();
     // the requested format is "tenths of a microsecond", so multiply by 10_000_000 and read seconds
     let delta = (now - windows_epoch) * 10_000_000;
     delta.num_seconds()
 }
-
 
 /// Performs the NTLMv1 DES encryption to calculate the response value to the challenge.
 pub fn des_long(key: [u8; 16], data: [u8; 8]) -> [u8; 24] {
@@ -1055,7 +1184,6 @@ pub fn des_long(key: [u8; 16], data: [u8; 8]) -> [u8; 24] {
 
     ret
 }
-
 
 /// Derives the encryption key from a password according to the LMv1 scheme.
 ///
@@ -1113,13 +1241,13 @@ pub fn lm_v1_password_func(password: &str) -> [u8; 16] {
     output
 }
 
-
 /// Derives the encryption key from a password according to the NTLMv1 scheme.
 ///
 /// The NTLMv1 scheme encodes the password as UTF-16 in little-endian byte order (without the Byte
 /// Order Mark) and hashes it using MD4.
 pub fn ntlm_v1_password_func(password: &str) -> [u8; 16] {
-    let password_bytes: Vec<u8> = password.encode_utf16()
+    let password_bytes: Vec<u8> = password
+        .encode_utf16()
         .flat_map(|p| p.to_le_bytes())
         .collect();
     let mut md4_state = <Md4 as Digest>::new();
@@ -1138,13 +1266,15 @@ pub fn ntlm_v2_password_func(creds: &Credentials) -> [u8; 16] {
     let hmac_key = ntlm_v1_password_func(&creds.password);
     let mut hmac_md5: Hmac<Md5> = <Hmac<Md5> as Mac>::new_from_slice(&hmac_key).unwrap();
 
-    let upper_user_bytes: Vec<u8> = creds.username
+    let upper_user_bytes: Vec<u8> = creds
+        .username
         .to_uppercase()
         .encode_utf16()
         .flat_map(|p| p.to_le_bytes())
         .collect();
     hmac_md5.update(&upper_user_bytes);
-    let dom_bytes: Vec<u8> = creds.domain
+    let dom_bytes: Vec<u8> = creds
+        .domain
         .encode_utf16()
         .flat_map(|p| p.to_le_bytes())
         .collect();
@@ -1158,7 +1288,10 @@ pub fn ntlm_v2_password_func(creds: &Credentials) -> [u8; 16] {
 /// Calculates an NTLMv1 response to the given server challenge.
 ///
 /// An LMv1 response is also included.
-pub fn respond_challenge_ntlm_v1(server_challenge: [u8; 8], creds: &Credentials) -> ChallengeResponse {
+pub fn respond_challenge_ntlm_v1(
+    server_challenge: [u8; 8],
+    creds: &Credentials,
+) -> ChallengeResponse {
     let ntlm_key = ntlm_v1_password_func(&creds.password);
     let ntlm_response = Vec::from(des_long(ntlm_key, server_challenge));
 
@@ -1181,7 +1314,10 @@ pub fn respond_challenge_ntlm_v1(server_challenge: [u8; 8], creds: &Credentials)
 /// Calculates an NTLMv1 response to the given server challenge.
 ///
 /// No LM response is included; instead, the NTLMv1 response is copied.
-pub fn respond_challenge_ntlm_v1_no_lm(server_challenge: [u8; 8], creds: &Credentials) -> ChallengeResponse {
+pub fn respond_challenge_ntlm_v1_no_lm(
+    server_challenge: [u8; 8],
+    creds: &Credentials,
+) -> ChallengeResponse {
     let ntlm_key = ntlm_v1_password_func(&creds.password);
     let ntlm_response = Vec::from(des_long(ntlm_key, server_challenge));
 
@@ -1204,7 +1340,10 @@ pub fn respond_challenge_ntlm_v1_no_lm(server_challenge: [u8; 8], creds: &Creden
 ///
 /// The NTLM response is in the extended format; the LM response field contains the randomly
 /// generated client challenge which has also influenced the calculation of the NTLM response.
-pub fn respond_challenge_ntlm_v1_extended(server_challenge: [u8; 8], creds: &Credentials) -> ChallengeResponse {
+pub fn respond_challenge_ntlm_v1_extended(
+    server_challenge: [u8; 8],
+    creds: &Credentials,
+) -> ChallengeResponse {
     let mut client_challenge: [u8; 8] = [0; 8];
     OsRng.fill(&mut client_challenge);
 
@@ -1243,19 +1382,30 @@ pub fn respond_challenge_ntlm_v1_extended(server_challenge: [u8; 8], creds: &Cre
 
 /// Calculates an NTLMv2 response to the given server challenge, including target info and time
 /// value to protect against replay attacks.
-pub fn respond_challenge_ntlm_v2(server_challenge: [u8; 8], target_info: &[u8], time: i64, creds: &Credentials) -> ChallengeResponse {
+pub fn respond_challenge_ntlm_v2(
+    server_challenge: [u8; 8],
+    target_info: &[u8],
+    time: i64,
+    creds: &Credentials,
+) -> ChallengeResponse {
     let mut client_challenge: [u8; 8] = [0; 8];
     OsRng.fill(&mut client_challenge);
 
     let mut temp = Vec::new();
     temp.push(0x01); // Responserversion
     temp.push(0x01); // HiResponserversion
-    for _ in 0..6 { temp.push(0x00); }
+    for _ in 0..6 {
+        temp.push(0x00);
+    }
     temp.extend_from_slice(&time.to_le_bytes());
     temp.extend_from_slice(&client_challenge);
-    for _ in 0..4 { temp.push(0x00); }
+    for _ in 0..4 {
+        temp.push(0x00);
+    }
     temp.extend_from_slice(&target_info);
-    for _ in 0..4 { temp.push(0x00); }
+    for _ in 0..4 {
+        temp.push(0x00);
+    }
 
     let ntlm_key = ntlm_v2_password_func(&creds);
 
